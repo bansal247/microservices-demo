@@ -4,7 +4,6 @@ pkg/
 *.pyc
 *.swp
 *~
-.vscode/
 .vs/
 .idea
 .skaffold-*.yaml
@@ -12,3 +11,5 @@ pkg/
 .project
 .eclipse.buildship.core.prefs
 release/wi-kubernetes-manifests.yaml
+config.bat
+node_modules
