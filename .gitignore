@@ -20,3 +20,5 @@ pkg/
 *.tfvars
 release/wi-kubernetes-manifests.yaml
 Dockerfile.pip
+config.bat
+node_modules
