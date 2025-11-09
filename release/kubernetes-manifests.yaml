@@ -123,7 +123,7 @@ spec:
                 - ALL
             privileged: false
             readOnlyRootFilesystem: true
-          image: us-central1-docker.pkg.dev/google-samples/microservices-demo/checkoutservice:v0.10.3
+          image: shashu247/checkoutservice-postgres:v1
           ports:
           - containerPort: 5050
           readinessProbe:
@@ -147,6 +147,8 @@ spec:
             value: "currencyservice:7000"
           - name: CART_SERVICE_ADDR
             value: "cartservice:7070"
+          - name: DATABASE_URL
+            value: "postgresql://postgres:admin123@postgres-postgresql.default.svc.cluster.local:5432/orders?sslmode=disable"
           resources:
             requests:
               cpu: 100m
