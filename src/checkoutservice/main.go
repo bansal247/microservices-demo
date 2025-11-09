@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strings"
 	"time"
 
 	"cloud.google.com/go/profiler"
@@ -38,6 +39,10 @@ import (
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	"go.opentelemetry.io/otel/propagation"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+
+	"database/sql"
+
+	_ "github.com/lib/pq"
 )
 
 const (
@@ -218,6 +223,33 @@ func mustConnGRPC(ctx context.Context, conn **grpc.ClientConn, addr string) {
 	}
 }
 
+func connectDB() (*sql.DB, error) {
+	connStr := os.Getenv("DATABASE_URL")
+	if connStr == "" {
+		return nil, fmt.Errorf("DATABASE_URL not set")
+	}
+	defaultDBURL := strings.Replace(connStr, "/orders?", "/postgres?", 1)
+	db, err := sql.Open("postgres", defaultDBURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to default DB: %v", err)
+	}
+	defer db.Close()
+
+	// Create orders database if it doesn't exist
+	_, err = db.Exec("CREATE DATABASE orders")
+	if err != nil && !strings.Contains(err.Error(), "already exists") {
+		return nil, fmt.Errorf("failed to create orders database: %v", err)
+	}
+
+	// Now connect to orders DB
+	ordersDB, err := sql.Open("postgres", connStr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to orders DB: %v", err)
+	}
+
+	return ordersDB, nil
+}
+
 func (cs *checkoutService) Check(ctx context.Context, req *healthpb.HealthCheckRequest) (*healthpb.HealthCheckResponse, error) {
 	return &healthpb.HealthCheckResponse{Status: healthpb.HealthCheckResponse_SERVING}, nil
 }
@@ -267,6 +299,12 @@ func (cs *checkoutService) PlaceOrder(ctx context.Context, req *pb.PlaceOrderReq
 		ShippingCost:       prep.shippingCostLocalized,
 		ShippingAddress:    req.Address,
 		Items:              prep.orderItems,
+	}
+
+	if err := cs.saveOrderToDB(ctx, orderResult, req.UserId, req.UserCurrency, req.Address, req.Email); err != nil {
+		log.Warnf("failed to save order in database: %+v", err)
+	} else {
+		log.Infof("order %s saved to database", orderResult.OrderId)
 	}
 
 	if err := cs.sendOrderConfirmation(ctx, req.Email, orderResult); err != nil {
@@ -390,4 +428,92 @@ func (cs *checkoutService) shipOrder(ctx context.Context, address *pb.Address, i
 		return "", fmt.Errorf("shipment failed: %+v", err)
 	}
 	return resp.GetTrackingId(), nil
+}
+
+func (cs *checkoutService) saveOrderToDB(ctx context.Context, order *pb.OrderResult, userID, userCurrency string, address *pb.Address, email string) error {
+	db, err := connectDB()
+	if err != nil {
+		return fmt.Errorf("DB connection failed: %v", err)
+	}
+	defer db.Close()
+
+	// Create tables if not exist
+	schema := `
+	CREATE TABLE IF NOT EXISTS users (
+		user_id TEXT PRIMARY KEY,
+		user_currency VARCHAR(10),
+		address TEXT,
+		email TEXT
+	);
+	CREATE TABLE IF NOT EXISTS money (
+		id SERIAL PRIMARY KEY,
+		currency_code VARCHAR(3),
+		units BIGINT,
+		nanos INT
+	);
+	CREATE TABLE IF NOT EXISTS orders (
+		order_id TEXT PRIMARY KEY,
+		user_id TEXT REFERENCES users(user_id) ON DELETE CASCADE,
+		shipping_tracking_id TEXT,
+		shipping_cost_id INT REFERENCES money(id),
+		shipping_address TEXT
+	);
+	CREATE TABLE IF NOT EXISTS order_items (
+		id SERIAL PRIMARY KEY,
+		order_id TEXT REFERENCES orders(order_id) ON DELETE CASCADE,
+		product_id TEXT,
+		quantity INT,
+		cost_id INT REFERENCES money(id)
+	);`
+	if _, err := db.Exec(schema); err != nil {
+		return fmt.Errorf("failed to ensure schema: %v", err)
+	}
+
+	_, err = db.Exec(`
+	INSERT INTO users (user_id, user_currency, address, email)
+	VALUES ($1, $2, $3, $4)
+	ON CONFLICT (user_id) DO UPDATE SET user_currency=$2, address=$3, email=$4;`,
+		userID, userCurrency, fmt.Sprintf("%s, %s, %s, %s", address.StreetAddress, address.City, address.State, address.Country), email)
+	if err != nil {
+		return fmt.Errorf("failed to insert user: %v", err)
+	}
+
+	var shippingCostID int
+	err = db.QueryRow(`
+	INSERT INTO money (currency_code, units, nanos)
+	VALUES ($1, $2, $3) RETURNING id;`,
+		order.ShippingCost.CurrencyCode, order.ShippingCost.Units, order.ShippingCost.Nanos).Scan(&shippingCostID)
+	if err != nil {
+		return fmt.Errorf("failed to insert shipping cost: %v", err)
+	}
+
+	_, err = db.Exec(`
+	INSERT INTO orders (order_id, user_id, shipping_tracking_id, shipping_cost_id, shipping_address)
+	VALUES ($1, $2, $3, $4, $5)
+	ON CONFLICT (order_id) DO NOTHING;`,
+		order.OrderId, userID, order.ShippingTrackingId, shippingCostID,
+		fmt.Sprintf("%s, %s, %s, %s", address.StreetAddress, address.City, address.State, address.Country))
+	if err != nil {
+		return fmt.Errorf("failed to insert order: %v", err)
+	}
+
+	for _, item := range order.Items {
+		var costID int
+		err := db.QueryRow(`
+		INSERT INTO money (currency_code, units, nanos)
+		VALUES ($1, $2, $3) RETURNING id;`,
+			item.Cost.CurrencyCode, item.Cost.Units, item.Cost.Nanos).Scan(&costID)
+		if err != nil {
+			return fmt.Errorf("failed to insert item cost: %v", err)
+		}
+		_, err = db.Exec(`
+		INSERT INTO order_items (order_id, product_id, quantity, cost_id)
+		VALUES ($1, $2, $3, $4);`,
+			order.OrderId, item.Item.ProductId, item.Item.Quantity, costID)
+		if err != nil {
+			return fmt.Errorf("failed to insert order item: %v", err)
+		}
+	}
+
+	return nil
 }
